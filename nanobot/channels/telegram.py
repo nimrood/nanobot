@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
 import re
 import time
 import unicodedata
+from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Literal
 
 from loguru import logger
@@ -19,10 +22,10 @@ from telegram.request import HTTPXRequest
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
-from nanobot.config.paths import get_media_dir
+from nanobot.config.paths import get_media_dir, get_logs_dir
 from nanobot.config.schema import Base
 from nanobot.security.network import validate_url_target
-from nanobot.utils.helpers import split_message
+from nanobot.utils.helpers import split_message, ensure_dir
 
 TELEGRAM_MAX_MESSAGE_LEN = 4000  # Telegram message character limit
 TELEGRAM_REPLY_CONTEXT_MAX_LEN = TELEGRAM_MAX_MESSAGE_LEN  # Max length for reply context in user message
@@ -179,6 +182,10 @@ class TelegramConfig(Base):
     connection_pool_size: int = 32
     pool_timeout: float = 5.0
     streaming: bool = True
+    history_buffer_size: int = 0  # Max messages to keep in memory for context (0 to disable)
+    history_log_dir: str | None = None  # Directory for continuous conversation logging
+    history_log_enabled: bool = False  # Enable writing all messages to disk
+    history_groups_only: bool = True  # Only record history for groups/channels, not direct DMs
 
 
 class TelegramChannel(BaseChannel):
@@ -218,6 +225,7 @@ class TelegramChannel(BaseChannel):
         self._media_group_buffers: dict[str, dict] = {}
         self._media_group_tasks: dict[str, asyncio.Task] = {}
         self._message_threads: dict[tuple[str, int], int] = {}
+        self._chat_history: dict[str, deque] = {}  # chat_id -> ring buffer of messages
         self._bot_user_id: int | None = None
         self._bot_username: str | None = None
         self._stream_bufs: dict[str, _StreamBuf] = {}  # chat_id -> streaming state
@@ -758,6 +766,46 @@ class TelegramChannel(BaseChannel):
         if len(self._message_threads) > 1000:
             self._message_threads.pop(next(iter(self._message_threads)))
 
+    def _record_history(self, chat_id: str, sender: str, text: str) -> None:
+        """Record message in memory ring buffer and/or log to disk."""
+        if not text:
+            return
+
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        entry = f"({timestamp}) {sender}: {text}"
+
+        # Ring buffer for in-memory context
+        if self.config.history_buffer_size > 0:
+            if chat_id not in self._chat_history:
+                self._chat_history[chat_id] = deque(maxlen=self.config.history_buffer_size)
+            self._chat_history[chat_id].append(entry)
+
+        # Continuous log to disk
+        if self.config.history_log_enabled:
+            log_dir = self.config.history_log_dir
+            if not log_dir:
+                log_dir = get_logs_dir() / "telegram"
+            else:
+                log_dir = Path(log_dir).expanduser()
+
+            try:
+                ensure_dir(log_dir)
+                log_file = log_dir / f"chat_{chat_id}.log"
+                with open(log_file, "a", encoding="utf-8") as f:
+                    f.write(entry + "\n")
+            except Exception as e:
+                logger.warning("Failed to write to Telegram history log: {}", e)
+
+    def _get_history_context(self, chat_id: str) -> str | None:
+        """Get history buffer as a formatted string, excluding the most recent message."""
+        if chat_id not in self._chat_history:
+            return None
+        history = list(self._chat_history[chat_id])
+        if len(history) <= 1:
+            return None
+        # Return all messages except the current one (which was just added)
+        return "\n".join(history[:-1])
+
     async def _forward_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Forward slash commands to the bus for unified handling in AgentLoop."""
         if not update.message or not update.effective_user:
@@ -782,10 +830,19 @@ class TelegramChannel(BaseChannel):
         user = update.effective_user
         chat_id = message.chat_id
         sender_id = self._sender_id(user)
+        str_chat_id = str(chat_id)
         self._remember_thread_context(message)
 
         # Store chat_id for replies
         self._chat_ids[sender_id] = chat_id
+
+        # Record history for building context (respecting group-only policy if enabled)
+        is_private = message.chat.type == "private"
+        should_record = not self.config.history_groups_only or not is_private
+        
+        if should_record and (message.text or message.caption):
+            sender_name = user.first_name or user.username or sender_id
+            self._record_history(str_chat_id, sender_name, message.text or message.caption)
 
         if not await self._is_group_message_for_bot(message):
             return
@@ -820,11 +877,17 @@ class TelegramChannel(BaseChannel):
             tag = reply_ctx or (f"[Reply to: {reply_media_parts[0]}]" if reply_media_parts else None)
             if tag:
                 content_parts.insert(0, tag)
+                
+        # Inject channel history context for group chats
+        if message.chat.type != "private":
+            history_context = self._get_history_context(str_chat_id)
+            if history_context:
+                content_parts.insert(0, f"[Recent channel history for context:\n{history_context}\n---]")
+
         content = "\n".join(content_parts) if content_parts else "[empty message]"
 
         logger.debug("Telegram message from {}: {}...", sender_id, content[:50])
 
-        str_chat_id = str(chat_id)
         metadata = self._build_message_metadata(message, user)
         session_key = self._derive_topic_session_key(message)
 
