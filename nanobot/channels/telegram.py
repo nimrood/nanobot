@@ -182,9 +182,9 @@ class TelegramConfig(Base):
     connection_pool_size: int = 32
     pool_timeout: float = 5.0
     streaming: bool = True
-    history_buffer_size: int = 0  # Max messages to keep in memory for context (0 to disable)
-    history_log_dir: str | None = None  # Directory for continuous conversation logging
-    history_log_enabled: bool = False  # Enable writing all messages to disk
+    history_context_size: int = 12  # Max messages to include in LLM context (0 to disable)
+    history_log_dir: str | None = None  # Directory for continuous message logging
+    history_log_enabled: bool = True  # Enable writing all messages to disk
     history_groups_only: bool = True  # Only record history for groups/channels, not direct DMs
 
 
@@ -775,9 +775,9 @@ class TelegramChannel(BaseChannel):
         entry = f"({timestamp}) {sender}: {text}"
 
         # Ring buffer for in-memory context
-        if self.config.history_buffer_size > 0:
+        if self.config.history_context_size > 0:
             if chat_id not in self._chat_history:
-                self._chat_history[chat_id] = deque(maxlen=self.config.history_buffer_size)
+                self._chat_history[chat_id] = deque(maxlen=self.config.history_context_size)
             self._chat_history[chat_id].append(entry)
 
         # Continuous log to disk
@@ -801,10 +801,13 @@ class TelegramChannel(BaseChannel):
         if chat_id not in self._chat_history:
             return None
         history = list(self._chat_history[chat_id])
-        if len(history) <= 1:
+        history_len = len(history)
+        if history_len <= 1:
             return None
-        # Return all messages except the current one (which was just added)
-        return "\n".join(history[:-1])
+        # Return last N messages excluding the current one
+        if history_len < self.config.history_context_size:
+            return "\n".join(history[:-1])
+        return "\n".join(history[history_len - self.config.history_context_size : -1])
 
     async def _forward_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Forward slash commands to the bus for unified handling in AgentLoop."""
