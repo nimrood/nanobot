@@ -258,6 +258,7 @@ Connect nanobot to your favorite chat platform. Want to build your own? See the 
 | **Matrix** | Homeserver URL + Access token |
 | **Email** | IMAP/SMTP credentials |
 | **QQ** | App ID + App Secret |
+| **Webhook** | HTTP POST callbacks (generic) |
 | **Wecom** | Bot ID + Bot Secret |
 | **Mochat** | Claw token (auto-setup available) |
 
@@ -604,6 +605,55 @@ nanobot gateway
 ```
 
 Now send a message to the bot from QQ — it should respond!
+
+</details>
+
+<details>
+<summary><b>Webhook</b></summary>
+
+Receives generic HTTP POST callbacks.
+
+**1. Configure**
+
+```json
+{
+  "channels": {
+    "webhook": {
+      "enabled": true,
+      "port": 18791,
+      "path": "/webhook",
+      "secret": "your-hmac-secret",
+      "allowFrom": ["*"]
+    }
+  }
+}
+```
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `port` | integer | `18791` | HTTP port to listen on |
+| `path` | string | `"/webhook"` | Endpoint path |
+| `secret` | string | `null` | Optional HMAC-SHA256 secret for signature verification |
+| `maxPayloadSize` | integer | `1048576` | Max body size in bytes (default 1MB) |
+
+**2. Send Webhook**
+
+Send a POST request with a JSON body:
+
+```bash
+curl -X POST http://localhost:18791/webhook \
+  -H "Content-Type: application/json" \
+  -H "X-Webhook-Signature: <hmac-sha256-signature>" \
+  -d '{"sender_id": "user123", "content": "Hello from webhook"}'
+```
+
+If `secret` is configured, nanobot expects a hex-encoded HMAC-SHA256 of the request body in the `X-Webhook-Signature` header.
+
+**3. Run**
+
+```bash
+nanobot gateway
+```
 
 </details>
 
